@@ -1,160 +1,172 @@
 # main.py
 import os
 import time
-import hmac
-import hashlib
 import json
-import asyncio
 import logging
-from typing import Optional
+import asyncio
+import functools
+from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 
 import requests
-from fastapi import FastAPI, Request, HTTPException, Depends, Header, BackgroundTasks
+import razorpay
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, Header, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlmodel import SQLModel, Field, create_engine, Session, select
-from jose import jwt
-from passlib.context import CryptContext
 
-# ---------- logging ----------
-logging.basicConfig(level=logging.INFO)
+# -----------------------
+# Basic logging
+# -----------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 logger = logging.getLogger("turbo-backend")
 
-# ---------- env / config ----------
+# -----------------------
+# Environment / config
+# -----------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./db.sqlite3")
-JWT_SECRET = os.getenv("JWT_SECRET", "")
-JWT_ALG = "HS256"
+VAST_API_KEY = os.getenv("VAST_API_KEY", "")
 RAZORPAY_KEY = os.getenv("RAZORPAY_KEY", "")
 RAZORPAY_SECRET = os.getenv("RAZORPAY_SECRET", "")
 RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-VAST_API_KEY = os.getenv("VAST_API_KEY", "")
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "30"))
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
 
-if not JWT_SECRET:
-    logger.warning("JWT_SECRET not set — auth tokens will be insecure.")
-
-# ---------- app + db ----------
-app = FastAPI(title="TurboCompute Backend (product-level)")
-
+# -----------------------
+# DB setup
+# -----------------------
 engine = create_engine(DATABASE_URL, echo=False, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
-
-# ---------- password helper ----------
-pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-def hash_password(p: str) -> str:
-    return pwd_ctx.hash(p)
-
-def verify_password(p: str, h: str) -> bool:
-    return pwd_ctx.verify(p, h)
-
-def create_access_token(subject: str, expires_minutes: int = 60*24*7):
-    payload = {"sub": str(subject), "exp": int((datetime.utcnow() + timedelta(minutes=expires_minutes)).timestamp())}
-    return jwt.encode(payload, JWT_SECRET or "devsecret", algorithm=JWT_ALG)
-
-def decode_token(token: str):
-    try:
-        data = jwt.decode(token, JWT_SECRET or "devsecret", algorithms=[JWT_ALG])
-        return data.get("sub")
-    except Exception:
-        return None
-
-# ---------- DB models ----------
+# Models
 class User(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     email: str
-    password_hash: str
     name: str = ""
+    password_hash: str = ""
 
 class WalletBalance(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int
     balance: float = 0.0
-    notify_threshold: float = 20.0
 
 class WalletTransaction(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int
     amount: float
-    razorpay_order_id: Optional[str] = None
-    razorpay_payment_id: Optional[str] = None
-    status: str = "created"
-    created_at: float = Field(default_factory=lambda: time.time())
+    note: str = ""
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class Instance(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int
-    provider: str = "vast"
     provider_instance_id: Optional[str] = None
-    status: str = "creating"
+    status: str = "pending"
     ip: Optional[str] = None
-    plan: Optional[str] = None
-    hours: int = 1
-    created_at: float = Field(default_factory=lambda: time.time())
     raw: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.utcnow)
 
-# create tables
 SQLModel.metadata.create_all(engine)
 
-# ---------- Helpers ----------
-def send_telegram(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.debug("Telegram not configured; skipping notification.")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+# -----------------------
+# Providers / clients
+# -----------------------
+rz_client = None
+if RAZORPAY_KEY and RAZORPAY_SECRET:
     try:
-        r = requests.post(url, json=data, timeout=10)
-        logger.debug("Telegram send status: %s", r.status_code)
+        rz_client = razorpay.Client(auth=(RAZORPAY_KEY, RAZORPAY_SECRET))
+        logger.info("Razorpay client initialised")
     except Exception as e:
-        logger.exception("Telegram send failed: %s", e)
+        logger.exception("Failed to init razorpay client: %s", e)
+        rz_client = None
 
-def razorpay_create_order(amount_in_inr: float, notes: dict = None):
-    if not (RAZORPAY_KEY and RAZORPAY_SECRET):
-        raise RuntimeError("Razorpay keys not configured")
-    url = "https://api.razorpay.com/v1/orders"
-    amt_paise = int(round(amount_in_inr * 100))
-    payload = {"amount": amt_paise, "currency": "INR", "payment_capture": 1}
-    if notes:
-        payload["notes"] = notes
-    r = requests.post(url, json=payload, auth=(RAZORPAY_KEY, RAZORPAY_SECRET), timeout=15)
-    r.raise_for_status()
-    return r.json()
+# Simple Vast adapter placeholder
+class VastAdapter:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
 
+    def create_instance(self, plan_code: str, hours: int):
+        # Implement integration with Vast API (this is pseudocode)
+        logger.info("VastAdapter.create_instance called plan=%s hours=%s", plan_code, hours)
+        # simulate provider response
+        return {"id": f"vast-{int(time.time())}", "status": "running", "ip": "1.2.3.4"}
+
+    def terminate_instance(self, provider_id: str):
+        logger.info("VastAdapter.terminate_instance %s", provider_id)
+        return {"status": "terminated"}
+
+    def get_instance_status(self, provider_id: str):
+        # return {"status": "running", "ip":"1.2.3.4", ...}
+        return {"status": "running", "ip": "1.2.3.4"}
+
+vast = VastAdapter(api_key=VAST_API_KEY)
+
+# -----------------------
+# FastAPI app
+# -----------------------
+app = FastAPI(title="TurboCompute Backend")
+
+# -----------------------
+# Simple in-memory rate limiter (per-user)
+# -----------------------
+_rate_buckets: Dict[str, Dict[str, Any]] = {}
+def rate_limit_key(user_identifier: str):
+    return f"rl:{user_identifier}"
+
+def check_rate_limit(user_id: str):
+    key = rate_limit_key(user_id)
+    bucket = _rate_buckets.get(key)
+    now = datetime.utcnow()
+    if not bucket:
+        _rate_buckets[key] = {"count": 1, "reset": now + timedelta(minutes=1)}
+        return True
+    if now >= bucket["reset"]:
+        _rate_buckets[key] = {"count": 1, "reset": now + timedelta(minutes=1)}
+        return True
+    if bucket["count"] >= RATE_LIMIT_PER_MIN:
+        return False
+    bucket["count"] += 1
+    return True
+
+# -----------------------
+# Helpers - Telegram
+# -----------------------
+def telegram_send(text: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram not configured")
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+        r = requests.post(url, json=payload, timeout=8)
+        logger.debug("Telegram response: %s %s", r.status_code, r.text)
+        return r.ok
+    except Exception as e:
+        logger.exception("telegram_send fail: %s", e)
+        return False
+
+# -----------------------
+# Helpers - Razorpay verify webhook
+# -----------------------
 def verify_razorpay_signature(body: bytes, signature: str) -> bool:
     if not RAZORPAY_WEBHOOK_SECRET:
-        logger.warning("Webhook secret not configured.")
+        logger.warning("RAZORPAY_WEBHOOK_SECRET not set")
         return False
-    computed = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    # Razorpay sometimes returns base64 signature; but most doc shows hex. We'll compare both.
-    if hmac.compare_digest(computed, signature):
-        return True
-    # try base64:
     try:
-        b64 = base64.b64encode(bytes.fromhex(computed)).decode()
-        if hmac.compare_digest(b64, signature):
-            return True
-    except Exception:
-        pass
-    return False
+        # razorpay has utility, but avoid dependency: compute HMAC-SHA256
+        import hmac, hashlib
+        computed = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(computed, signature)
+    except Exception as e:
+        logger.exception("verify signature error: %s", e)
+        return False
 
-# ---------- Auth dependency ----------
-def get_current_user(authorization: Optional[str] = Header(None)):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing authorization header")
-    token = authorization.replace("Bearer ", "")
-    sub = decode_token(token)
-    if not sub:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    with Session(engine) as session:
-        user = session.get(User, int(sub))
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found")
-        return user
-
-# ---------- Request Schemas ----------
+# -----------------------
+# Request schemas
+# -----------------------
 class SignupRequest(BaseModel):
     email: str
     password: str
@@ -164,25 +176,49 @@ class LoginRequest(BaseModel):
     email: str
     password: str
 
-class TopupRequest(BaseModel):
-    amount: float
-
 class CreateInstanceRequest(BaseModel):
     plan_code: str
     hours: int = 1
 
-# ---------- Endpoints ----------
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+# -----------------------
+# Auth (very simple token)
+# -----------------------
+# For demo: token is "user-{id}" ; in prod replace with JWT
+def create_token(user_id: int) -> str:
+    return f"user-{user_id}"
 
+def decode_token(token: str) -> Optional[int]:
+    if token and token.startswith("user-"):
+        try:
+            return int(token.split("-", 1)[1])
+        except:
+            return None
+    return None
+
+async def get_current_user(authorization: Optional[str] = Header(None)):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="No authorization header")
+    token = authorization.replace("Bearer ", "")
+    user_id = decode_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    with Session(engine) as session:
+        user = session.get(User, user_id)
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        return user
+
+# -----------------------
+# Auth endpoints
+# -----------------------
 @app.post("/signup")
 def signup(req: SignupRequest):
     with Session(engine) as session:
         exists = session.exec(select(User).where(User.email == req.email)).first()
         if exists:
-            raise HTTPException(status_code=400, detail="Email already registered")
-        user = User(email=req.email, password_hash=hash_password(req.password), name=req.name)
+            raise HTTPException(status_code=400, detail="Already exists")
+        # NOTE: store hashed passwords in prod
+        user = User(email=req.email, password_hash=req.password, name=req.name)
         session.add(user)
         session.commit()
         session.refresh(user)
@@ -190,18 +226,21 @@ def signup(req: SignupRequest):
         wb = WalletBalance(user_id=user.id, balance=0.0)
         session.add(wb)
         session.commit()
-        token = create_access_token(str(user.id))
+        token = create_token(user.id)
         return {"token": token, "user_id": user.id}
 
 @app.post("/login")
 def login(req: LoginRequest):
     with Session(engine) as session:
         user = session.exec(select(User).where(User.email == req.email)).first()
-        if not user or not verify_password(req.password, user.password_hash):
+        if not user or user.password_hash != req.password:
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        token = create_access_token(str(user.id))
+        token = create_token(user.id)
         return {"token": token, "user_id": user.id}
 
+# -----------------------
+# Wallet endpoints
+# -----------------------
 @app.get("/wallet")
 def get_wallet(user = Depends(get_current_user)):
     with Session(engine) as session:
@@ -209,149 +248,132 @@ def get_wallet(user = Depends(get_current_user)):
         if not wb:
             wb = WalletBalance(user_id=user.id, balance=0.0)
             session.add(wb); session.commit(); session.refresh(wb)
-        return {"balance": wb.balance, "notify_threshold": wb.notify_threshold}
+        return {"balance": wb.balance}
 
-@app.post("/wallet/topup")
-def wallet_topup(req: TopupRequest, user = Depends(get_current_user)):
-    # Create razorpay order and store transaction
-    if req.amount <= 0:
-        raise HTTPException(status_code=400, detail="Invalid amount")
-    with Session(engine) as session:
-        tx = WalletTransaction(user_id=user.id, amount=req.amount, status="creating")
-        session.add(tx); session.commit(); session.refresh(tx)
-        try:
-            order = razorpay_create_order(req.amount, notes={"user_id": str(user.id), "tx_id": str(tx.id)})
-            tx.razorpay_order_id = order.get("id")
-            tx.status = "order_created"
-            session.add(tx); session.commit()
-            return {"order": order, "razorpay_key": RAZORPAY_KEY, "tx_id": tx.id}
-        except Exception as e:
-            tx.status = "order_failed"
-            session.add(tx); session.commit()
-            logger.exception("Razorpay order creation failed")
-            raise HTTPException(status_code=500, detail=str(e))
+@app.post("/wallet/create-order")
+def create_order(amount: float, user = Depends(get_current_user)):
+    if not rz_client:
+        raise HTTPException(status_code=500, detail="Razorpay not configured")
+    try:
+        order = rz_client.order.create({
+            "amount": int(amount * 100),
+            "currency": "INR",
+            "payment_capture": 1,
+            "notes": {"user_id": str(user.id)}
+        })
+        return {"order": order}
+    except Exception as e:
+        logger.exception("create_order error")
+        raise HTTPException(status_code=500, detail=str(e))
 
+# -----------------------
+# Razorpay webhook
+# -----------------------
 @app.post("/webhook/razorpay")
 async def razorpay_webhook(request: Request):
     body = await request.body()
     sig = request.headers.get("X-Razorpay-Signature", "")
-    # Verify signature (simple hmac)
-    if RAZORPAY_WEBHOOK_SECRET:
-        expected = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, sig):
-            # try alternate (SDK style) fallback: use SDK if available
-            logger.warning("Webhook signature mismatch")
-            raise HTTPException(status_code=400, detail="Invalid signature")
-    else:
-        logger.warning("No webhook secret configured; rejecting")
+    if not RAZORPAY_WEBHOOK_SECRET:
         raise HTTPException(status_code=500, detail="Webhook secret not configured")
+    if not verify_razorpay_signature(body, sig):
+        raise HTTPException(status_code=400, detail="Invalid signature")
     data = await request.json()
-    event = data.get("event")
-    logger.info("Razorpay webhook received: %s", event)
-    if event == "payment.captured":
-        entity = data.get("payload", {}).get("payment", {}).get("entity", {})
-        order_id = entity.get("order_id")
-        payment_id = entity.get("id")
-        amount = entity.get("amount", 0) / 100.0
-        notes = entity.get("notes", {})
-        user_id = int(notes.get("user_id") or 0)
-        tx_id_note = notes.get("tx_id")
-        with Session(engine) as session:
-            # update transaction
-            tx = None
-            if order_id:
-                tx = session.exec(select(WalletTransaction).where(WalletTransaction.razorpay_order_id == order_id)).first()
-            if not tx and tx_id_note:
-                tx = session.get(WalletTransaction, int(tx_id_note))
-            if tx:
-                tx.razorpay_payment_id = payment_id
-                tx.status = "paid"
-                session.add(tx)
-            # update wallet
-            if user_id:
-                wb = session.exec(select(WalletBalance).where(WalletBalance.user_id == user_id)).first()
-                if not wb:
-                    wb = WalletBalance(user_id=user_id, balance=0.0)
-                    session.add(wb); session.commit(); session.refresh(wb)
-                wb.balance += amount
-                session.add(wb)
-                # record separate tx
-                wtx = WalletTransaction(user_id=user_id, amount=amount, razorpay_order_id=order_id, razorpay_payment_id=payment_id, status="paid")
-                session.add(wtx)
-                session.commit()
-                send_telegram(f"Payment received ₹{amount:.2f} for user {user_id}. New balance: ₹{wb.balance:.2f}")
-    return JSONResponse({"ok": True})
+    try:
+        # process payment captured events
+        if data.get("event") == "payment.captured":
+            payload = data.get("payload", {})
+            p = payload.get("payment", {}).get("entity", {})
+            notes = p.get("notes", {}) or {}
+            try:
+                user_id = int(notes.get("user_id", 0))
+            except:
+                user_id = 0
+            amt = p.get("amount", 0) / 100.0
+            if user_id and amt > 0:
+                with Session(engine) as session:
+                    wb = session.exec(select(WalletBalance).where(WalletBalance.user_id == user_id)).first()
+                    if not wb:
+                        wb = WalletBalance(user_id=user_id, balance=0.0)
+                        session.add(wb)
+                    wb.balance += float(amt)
+                    session.add(WalletTransaction(user_id=user_id, amount=amt, note="rzp payment"))
+                    session.add(wb)
+                    session.commit()
+                msg = f"Payment received: ₹{amt:.2f} for user {user_id} — wallet updated."
+                telegram_send(msg)
+        return {"status": "ok"}
+    except Exception as e:
+        logger.exception("webhook handler error")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ---------- Instance / provider integration ----------
-# Minimal VastAdapter stub: if you have provider.vast_adapter, replace this class and import it.
-class VastAdapter:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-
-    def create_instance(self, plan_code: str, hours: int):
-        # This is a stub placeholder. Replace with real API calls to vast.ai or your provider.
-        # Return dict with status, provider_instance_id, ip
-        return {"status": "running", "provider_instance_id": f"vm-{int(time.time())}", "ip": "1.2.3.4", "raw": {"plan": plan_code, "hours": hours}}
-
-    def terminate_instance(self, provider_instance_id: str):
-        return True
-
-vast = VastAdapter(VAST_API_KEY) if VAST_API_KEY else None
-
+# -----------------------
+# Instance creation + lifecycle
+# -----------------------
 @app.post("/create-instance")
 def create_instance(req: CreateInstanceRequest, background_tasks: BackgroundTasks, user = Depends(get_current_user)):
-    # Check wallet balance quick check & reserve estimated cost
-    EST_PRICE_PER_HOUR = 10.0  # product-level default; replace per plan
-    est_price = EST_PRICE_PER_HOUR * req.hours
+    # basic rate limit
+    if not check_rate_limit(str(user.id)):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
     with Session(engine) as session:
         wb = session.exec(select(WalletBalance).where(WalletBalance.user_id == user.id)).first()
-        if not wb or wb.balance < est_price:
+        if not wb or wb.balance <= 0:
             raise HTTPException(status_code=402, detail="Insufficient wallet balance")
-        # reserve (deduct estimate)
-        wb.balance -= est_price
-        session.add(wb)
-        inst = Instance(user_id=user.id, status="creating", plan=req.plan_code, hours=req.hours)
+        inst = Instance(user_id=user.id, status="pending")
         session.add(inst)
-        session.commit(); session.refresh(inst)
-        # launch in background
-        background_tasks.add_task(_launch_and_update, inst.id, req.plan_code, req.hours, est_price)
+        session.commit()
+        session.refresh(inst)
+        # Launch background task
+        background_tasks.add_task(_launch_and_update, inst.id, req)
         return {"id": inst.id, "status": inst.status}
 
-def _launch_and_update(instance_db_id: int, plan_code: str, hours: int, reserved_price: float):
-    with Session(engine) as session:
-        inst = session.get(Instance, instance_db_id)
-        if not inst:
-            return
-        try:
-            if not vast:
-                raise RuntimeError("Provider (vast) not configured")
-            prov = vast.create_instance(plan_code, hours)
-            inst.provider_instance_id = prov.get("provider_instance_id")
-            inst.status = prov.get("status", "running")
-            inst.ip = prov.get("ip")
-            inst.raw = json.dumps(prov.get("raw", prov))
-            session.add(inst)
-            session.commit()
-            # Basic billing: keep reserved, you may later reconcile actual usage and refund/charge extra.
-            logger.info("Launched instance %s for user %s", inst.id, inst.user_id)
-        except Exception as e:
-            inst.status = "error"
-            inst.raw = str(e)
-            session.add(inst)
-            session.commit()
-            # refund reserved price on failure
-            wb = session.exec(select(WalletBalance).where(WalletBalance.user_id == inst.user_id)).first()
-            if wb:
-                wb.balance += reserved_price
-                session.add(wb); session.commit()
-            send_telegram(f"Instance launch failed for user {inst.user_id}: {e}")
+async def _launch_and_update(instance_db_id: int, req: CreateInstanceRequest):
+    # Runs in background (async) - create provider instance, poll for status, deduct estimated price
+    # This is best-effort: in production use task queue (RQ/Celery)
+    try:
+        with Session(engine) as session:
+            inst = session.get(Instance, instance_db_id)
+            if not inst:
+                logger.error("instance missing")
+                return
+            # create on provider
+            try:
+                prov_resp = vast.create_instance(req.plan_code, req.hours)
+                inst.provider_instance_id = prov_resp.get("id")
+                inst.status = prov_resp.get("status", "starting")
+                inst.ip = prov_resp.get("ip")
+                inst.raw = json.dumps(prov_resp)
+                session.add(inst); session.commit(); session.refresh(inst)
+                telegram_send(f"Instance {inst.id} created: provider_id={inst.provider_instance_id}")
+            except Exception as e:
+                inst.status = "error"
+                inst.raw = str(e)
+                session.add(inst); session.commit()
+                telegram_send(f"Instance create failed: {e}")
+                return
 
+            # simple billing: deduct estimated price upfront (example: 10 * hours)
+            estimated_price = 10.0 * max(1, req.hours)
+            wb = session.exec(select(WalletBalance).where(WalletBalance.user_id == inst.user_id)).first()
+            if wb and wb.balance >= estimated_price:
+                wb.balance -= estimated_price
+                session.add(WalletTransaction(user_id=inst.user_id, amount=-estimated_price, note="estimated charge"))
+                session.add(wb); session.commit()
+                telegram_send(f"Deducted estimated ₹{estimated_price:.2f} for instance {inst.id}. New balance: ₹{wb.balance:.2f}")
+            else:
+                # insufficient: mark pending payment and still continue optionally
+                telegram_send(f"Insufficient balance to deduct estimated price for instance {inst.id} — current balance: ₹{wb.balance if wb else 0:.2f}")
+
+    except Exception as e:
+        logger.exception("background _launch_and_update error")
+
+# status check endpoint
 @app.get("/status/{instance_id}")
 def get_status(instance_id: int, user = Depends(get_current_user)):
     with Session(engine) as session:
         inst = session.get(Instance, instance_id)
         if not inst:
-            raise HTTPException(status_code=404, detail="Instance not found")
+            raise HTTPException(status_code=404, detail="Not found")
         if inst.user_id != user.id:
             raise HTTPException(status_code=403, detail="Forbidden")
         return {"id": inst.id, "status": inst.status, "ip": inst.ip, "raw": inst.raw}
@@ -361,7 +383,7 @@ def terminate_instance(instance_id: int, user = Depends(get_current_user)):
     with Session(engine) as session:
         inst = session.get(Instance, instance_id)
         if not inst:
-            raise HTTPException(status_code=404, detail="Instance not found")
+            raise HTTPException(status_code=404, detail="Not found")
         if inst.user_id != user.id:
             raise HTTPException(status_code=403, detail="Forbidden")
         if not inst.provider_instance_id:
@@ -369,38 +391,103 @@ def terminate_instance(instance_id: int, user = Depends(get_current_user)):
             session.add(inst); session.commit()
             return {"status": "terminated"}
         try:
-            if not vast:
-                raise RuntimeError("Provider adapter not configured")
-            ok = vast.terminate_instance(inst.provider_instance_id)
+            resp = vast.terminate_instance(inst.provider_instance_id)
             inst.status = "terminated"
             session.add(inst); session.commit()
-            return {"status": "terminated"}
+            telegram_send(f"Instance {inst.id} terminated.")
+            return {"status": "terminated", "provider": resp}
         except Exception as e:
+            logger.exception("terminate error")
             raise HTTPException(status_code=500, detail=str(e))
 
-# ---------- Background wallet checker ----------
-async def wallet_checker_loop():
+# -----------------------
+# Background poller: fee reconciliation, auto-stop & low-balance alerts
+# -----------------------
+async def background_poll_loop():
     while True:
         try:
             with Session(engine) as session:
-                wallets = session.exec(select(WalletBalance)).all()
-                for w in wallets:
-                    if w.balance <= w.notify_threshold:
-                        send_telegram(f"⚠️ Low balance for user {w.user_id}: ₹{w.balance:.2f}. Please top-up to continue running instances.")
-        except Exception as e:
-            logger.exception("Checker error: %s", e)
-        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+                # check running instances and update status from provider
+                instances = session.exec(select(Instance).where(Instance.status != "terminated")).all()
+                for inst in instances:
+                    if not inst.provider_instance_id:
+                        continue
+                    try:
+                        sdata = vast.get_instance_status(inst.provider_instance_id)
+                        inst.status = sdata.get("status", inst.status)
+                        inst.ip = sdata.get("ip", inst.ip)
+                        inst.raw = json.dumps(sdata)
+                        session.add(inst)
+                        session.commit()
+                        # if running -> compute hourly charge per check interval
+                        if inst.status == "running":
+                            # simple pro-rata deduction per interval
+                            charge_per_hour = 10.0  # configurable per plan in prod
+                            charge_per_interval = charge_per_hour * (CHECK_INTERVAL_SECONDS / 3600.0)
+                            wb = session.exec(select(WalletBalance).where(WalletBalance.user_id == inst.user_id)).first()
+                            if wb:
+                                if wb.balance >= charge_per_interval:
+                                    wb.balance -= charge_per_interval
+                                    session.add(WalletTransaction(user_id=inst.user_id, amount=-charge_per_interval, note=f"usage instance {inst.id}"))
+                                    session.add(wb); session.commit()
+                                else:
+                                    # low balance -> notify and terminate
+                                    telegram_send(f"Low balance (₹{wb.balance:.2f}) for user {inst.user_id}, terminating instance {inst.id}.")
+                                    try:
+                                        vast.terminate_instance(inst.provider_instance_id)
+                                    except Exception:
+                                        pass
+                                    inst.status = "terminated"
+                                    session.add(inst); session.commit()
+                    except Exception as e:
+                        logger.exception("poll update instance error")
+                # optionally send daily summary or low-balance alerts
+            await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+        except Exception:
+            logger.exception("background poll loop exception")
+            await asyncio.sleep(5)
 
 @app.on_event("startup")
-def on_startup():
-    logger.info("Starting backend, DB at %s", DATABASE_URL)
-    # start background loop
-    loop = asyncio.get_event_loop()
-    loop.create_task(wallet_checker_loop())
+async def startup_event():
+    # start background poller
+    asyncio.create_task(background_poll_loop())
+    logger.info("Background poller started")
 
-# ---------- simple root ----------
-@app.get("/")
-def root():
-    return {"ok": True, "note": "TurboCompute Backend"}
+# -----------------------
+# Admin endpoints (simple token)
+# -----------------------
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "admintoken123")
+def admin_auth(token: Optional[str] = Header(None)):
+    if token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-# ---------- run with uvicorn or gunicorn -k uvicorn.workers.UvicornWorker main:app ----------
+@app.get("/admin/instances")
+def admin_list_instances(_=Depends(admin_auth)):
+    with Session(engine) as session:
+        rows = session.exec(select(Instance)).all()
+        return {"instances": [r.dict() for r in rows]}
+
+@app.get("/admin/wallets")
+def admin_wallets(_=Depends(admin_auth)):
+    with Session(engine) as session:
+        rows = session.exec(select(WalletBalance)).all()
+        return {"wallets": [r.dict() for r in rows]}
+
+# -----------------------
+# Global exception handler
+# -----------------------
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error: %s", exc)
+    try:
+        telegram_send(f"Server error: {str(exc)}")
+    except:
+        pass
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
+# -----------------------
+# Simple health
+# -----------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
