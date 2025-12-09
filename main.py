@@ -257,65 +257,91 @@ async def startup_event():
 # ---------------------------
 @app.post("/signup")
 def signup(req: SignupRequest):
+    """
+    Create a new user, give signup credit, create wallet and transaction,
+    set referral if provided and return token + user info.
+    """
+    # basic password length checks (bcrypt limit ~72 bytes)
+    if not req.password or len(req.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    if len(req.password) > 72:
+        # bcrypt/paslib will fail for >72 bytes - reject early
+        raise HTTPException(status_code=400, detail="Password too long (max 72 characters)")
+
     with Session(engine) as session:
+        # check duplicate email
         exists = session.exec(select(User).where(User.email == req.email)).first()
         if exists:
             raise HTTPException(status_code=400, detail="Email already exists")
-        hashed = hash_password(req.password)
-        user = User(email=req.email, name=req.name or "", password_hash=hashed)
-        # referral logic: if referral_code provided attempt to parse "TC-<refid>-..."
-        if req.referral_code:
-            try:
-                # allow either "TC-<id>-..." or "user-<id>"
-                if req.referral_code.startswith("TC-"):
-                    parts = req.referral_code.split("-", 2)
-                    ref_id = int(parts[1])
-                elif req.referral_code.startswith("user-"):
-                    ref_id = int(req.referral_code.split("-", 1)[1])
-                else:
-                    ref_id = None
-                if ref_id:
-                    ref_user = session.get(User, ref_id)
-                    if ref_user:
-                        user.referred_by = ref_id
-            except Exception:
-                user.referred_by = None
 
+        try:
+            hashed = hash_password(req.password)
+        except Exception as e:
+            logger.exception("hash_password failed: %s", e)
+            raise HTTPException(status_code=500, detail="Server error")
+
+        # create user record
+        user = User(email=req.email, name=(req.name or ""), password_hash=hashed)
         session.add(user)
         session.commit()
         session.refresh(user)
 
-        # create referral code for this user
-        user.referral_code = generate_referral_code(user.id)
+        # handle referral (optional)
+        user.referred_by = None
+        if req.referral_code:
+            try:
+                # allow codes like "TC-<id>-xxx" or "user-<id>"
+                if req.referral_code.startswith("TC-"):
+                    parts = req.referral_code.split("-")
+                    ref_id = int(parts[1]) if len(parts) > 1 else None
+                elif req.referral_code.startswith("user-"):
+                    # if someone passed a user-<id> style token
+                    ref_id = int(req.referral_code.split("-", 1)[1])
+                else:
+                    # fallback: maybe they just passed numeric id
+                    ref_id = int(req.referral_code)
+            except Exception:
+                ref_id = None
+
+            if ref_id:
+                ref_user = session.get(User, ref_id)
+                if ref_user:
+                    user.referred_by = ref_id
+
+        # update user with referral & generate referral code
+        user.referral_code = generate_referral_code(user.id) if user.id else generate_referral_code(int(time.time()))
         session.add(user)
-
-        # create wallet and give signup free credit
-        wb = WalletBalance(user_id=user.id, balance=SIGNUP_FREE_CREDIT)
-        session.add(wb)
         session.commit()
-        session.refresh(wb)
+        session.refresh(user)
 
-        # transaction record
-        wt = WalletTransaction(user_id=user.id, amount=SIGNUP_FREE_CREDIT, note="signup_credit")
-        session.add(wt)
-        session.commit()
+        # create wallet and give signup credit
+        try:
+            wb = WalletBalance(user_id=user.id, balance=float(SIGNUP_FREE_CREDIT) if 'SIGNUP_FREE_CREDIT' in globals() else 0.0)
+            session.add(wb)
+            session.commit()
+            session.refresh(wb)
+        except Exception as e:
+            logger.exception("create wallet failed: %s", e)
+            # continue but warn — we still want to return user created if wallet failed
+            wb = None
 
+        # transaction record for signup credit (if any)
+        try:
+            if wb:
+                wt = WalletTransaction(user_id=user.id, amount=wb.balance, note="signup_credit")
+                session.add(wt)
+                session.commit()
+        except Exception as e:
+            logger.exception("create wallet transaction failed: %s", e)
+
+        # create token and return
         token = create_token(user.id)
         return {
             "token": token,
             "user_id": user.id,
             "referral_code": user.referral_code,
-            "signup_credit": SIGNUP_FREE_CREDIT
+            "signup_credit": wb.balance if wb else 0.0
         }
-
-@app.post("/login")
-def login(req: LoginRequest):
-    with Session(engine) as session:
-        user = session.exec(select(User).where(User.email == req.email)).first()
-        if not user or not verify_password(req.password, user.password_hash):
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-        token = create_token(user.id)
-        return {"token": token, "user_id": user.id, "referral_code": user.referral_code}
 
 # ---------------------------
 # Wallet endpoints
