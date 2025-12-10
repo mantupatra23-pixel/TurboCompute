@@ -252,36 +252,45 @@ async def startup_event():
     asyncio.create_task(background_poll_loop())
     logger.info("Background poller started")
 
-# ---------------------------
+# ----------------------
 # Auth endpoints
-# ---------------------------
+# ----------------------
 @app.post("/signup")
 def signup(req: SignupRequest):
     """
-    Create a new user, give signup credit, create wallet and transaction,
-    set referral if provided and return token + user info.
+    Create a new user, give signup credit, create wallet, set referral if provided and return token + user
     """
     # basic password length checks (bcrypt limit ~72 bytes)
-    if not req.password or len(req.password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
-    if len(req.password) > 72:
-        # bcrypt/paslib will fail for >72 bytes - reject early
-        raise HTTPException(status_code=400, detail="Password too long (max 72 characters)")
+    if not req.password or len(req.password.strip()) < 6:
+        raise HTTPException(status_code=400, detail="Password too short (min 6 chars)")
+    clean_pass = req.password.strip()
+    if len(clean_pass.encode("utf-8")) > 72:
+        # bcrypt/paslib will fail for >72 bytes - reject early with friendly message
+        raise HTTPException(status_code=400, detail="Password too long (max 72 bytes)")
 
     with Session(engine) as session:
         # check duplicate email
         exists = session.exec(select(User).where(User.email == req.email)).first()
         if exists:
-            raise HTTPException(status_code=400, detail="Email already exists")
+            raise HTTPException(status_code=400, detail="Email already registered")
 
+        # hash password
         try:
-            hashed = hash_password(req.password)
+            hashed = hash_password(clean_pass)
         except Exception as e:
             logger.exception("hash_password failed: %s", e)
-            raise HTTPException(status_code=500, detail="Server error")
+            raise HTTPException(status_code=500, detail="internal error")
 
         # create user record
-        user = User(email=req.email, name=(req.name or ""), password_hash=hashed)
+        user = User(email=req.email, name=(req.name or "").strip())
+        # if your User model stores password hash field name is password_hash or similar:
+        # assign accordingly; adapt if your model uses different attr name.
+        if hasattr(user, "password_hash"):
+            user.password_hash = hashed
+        else:
+            # fallback: set attribute 'password'
+            user.password = hashed
+
         session.add(user)
         session.commit()
         session.refresh(user)
@@ -290,15 +299,12 @@ def signup(req: SignupRequest):
         user.referred_by = None
         if req.referral_code:
             try:
-                # allow codes like "TC-<id>-xxx" or "user-<id>"
                 if req.referral_code.startswith("TC-"):
-                    parts = req.referral_code.split("-")
+                    parts = req.referral_code.split("-", 2)
                     ref_id = int(parts[1]) if len(parts) > 1 else None
                 elif req.referral_code.startswith("user-"):
-                    # if someone passed a user-<id> style token
                     ref_id = int(req.referral_code.split("-", 1)[1])
                 else:
-                    # fallback: maybe they just passed numeric id
                     ref_id = int(req.referral_code)
             except Exception:
                 ref_id = None
@@ -308,27 +314,26 @@ def signup(req: SignupRequest):
                 if ref_user:
                     user.referred_by = ref_id
 
-        # update user with referral & generate referral code
-        user.referral_code = generate_referral_code(user.id) if user.id else generate_referral_code(int(time.time()))
+        # update user with referral & generate referral
+        user.referral_code = generate_referral_code(user.id)
         session.add(user)
         session.commit()
         session.refresh(user)
 
-        # create wallet and give signup credit
+        # create wallet and give signup credit (if configured)
         try:
-            wb = WalletBalance(user_id=user.id, balance=float(SIGNUP_FREE_CREDIT) if 'SIGNUP_FREE_CREDIT' in globals() else 0.0)
+            wb = WalletBalance(user_id=user.id, balance=SIGNUP_FREE_CREDIT if 'SIGNUP_FREE_CREDIT' in globals() else 0.0)
             session.add(wb)
             session.commit()
             session.refresh(wb)
         except Exception as e:
             logger.exception("create wallet failed: %s", e)
-            # continue but warn — we still want to return user created if wallet failed
-            wb = None
+            wb = None  # continue but warn
 
         # transaction record for signup credit (if any)
         try:
             if wb:
-                wt = WalletTransaction(user_id=user.id, amount=wb.balance, note="signup_credit")
+                wt = WalletTransaction(user_id=user.id, amount=wb.balance or 0.0, note="signup_credit")
                 session.add(wt)
                 session.commit()
         except Exception as e:
@@ -342,6 +347,33 @@ def signup(req: SignupRequest):
             "referral_code": user.referral_code,
             "signup_credit": wb.balance if wb else 0.0
         }
+
+
+@app.post("/login")
+def login(req: LoginRequest):
+    """
+    Basic login: check user exists and verify password (strip input).
+    Returns token on success.
+    """
+    if not req.password or not req.email:
+        raise HTTPException(status_code=400, detail="Missing email or password")
+
+    clean_pass = req.password.strip()
+    with Session(engine) as session:
+        user = session.exec(select(User).where(User.email == req.email)).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+        # user may store password hash under different attribute name; adapt:
+        stored_hash = getattr(user, "password_hash", None) or getattr(user, "password", None)
+        if not stored_hash:
+            raise HTTPException(status_code=500, detail="user has no password set")
+
+        if not verify_password(clean_pass, stored_hash):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+        token = create_token(user.id)
+        return {"token": token, "user_id": user.id}
 
 # ---------------------------
 # Wallet endpoints
